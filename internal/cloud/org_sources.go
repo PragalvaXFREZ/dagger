@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type Source struct {
+	Provider     string  `json:"provider"`
+	Instance     string  `json:"instance"`
 	Name         string  `json:"name"`
 	ID           string  `json:"id"`
 	Type         string  `json:"type"`
@@ -21,6 +24,8 @@ type SourceRepository struct {
 }
 
 type MappedSource struct {
+	Provider       string   `json:"provider"`
+	Instance       string   `json:"instance"`
 	SourceName     string   `json:"sourceName"`
 	InstallationID string   `json:"installationId"`
 	Mode           string   `json:"mode"`
@@ -63,6 +68,8 @@ type OrgDetails struct {
 const getSourcesOperation = `
 query GetSources {
 	sources {
+		provider
+		instance
 		name
 		id
 		type
@@ -78,7 +85,14 @@ func (c *Client) Sources(ctx context.Context) ([]Source, error) {
 		Sources []Source `json:"sources"`
 	}
 	if err := c.doGraphQL(ctx, "GetSources", getSourcesOperation, nil, &data); err != nil {
-		return nil, err
+		// New CLI versions can still talk to a Cloud API predating provider metadata.
+		if !strings.Contains(err.Error(), `Cannot query field "provider"`) && !strings.Contains(err.Error(), `Cannot query field "instance"`) {
+			return nil, err
+		}
+		legacy := strings.ReplaceAll(strings.ReplaceAll(getSourcesOperation, "\t\tprovider\n", ""), "\t\tinstance\n", "")
+		if err := c.doGraphQL(ctx, "GetSources", legacy, nil, &data); err != nil {
+			return nil, err
+		}
 	}
 	return data.Sources, nil
 }
@@ -390,4 +404,29 @@ func (c *Client) CreatePortalSession(ctx context.Context, orgID string) (string,
 		return "", err
 	}
 	return data.CreatePortalSession, nil
+}
+
+// GitLabConnection represents one linked account on a configured GitLab instance.
+type GitLabConnection struct {
+	ID        string `json:"id"`
+	Instance  string `json:"instance"`
+	Username  string `json:"username"`
+	CreatedAt string `json:"createdAt"`
+}
+type GitLabSetup struct {
+	Instances   []string           `json:"gitlabInstances"`
+	Connections []GitLabConnection `json:"gitlabConnections"`
+}
+
+func (c *Client) GitLabSetup(ctx context.Context) (*GitLabSetup, error) {
+	var result GitLabSetup
+	err := c.doGraphQL(ctx, "GetGitLabSetup", `query GetGitLabSetup { gitlabInstances gitlabConnections { id instance username createdAt } }`, nil, &result)
+	return &result, err
+}
+func (c *Client) GitLabOAuthURL(ctx context.Context, instance, redirect string) (string, error) {
+	var result struct {
+		URL string `json:"gitlabOAuthURL"`
+	}
+	err := c.doGraphQL(ctx, "GetGitLabOAuthURL", `query GetGitLabOAuthURL($instance: String!, $redirectURI: String!) { gitlabOAuthURL(instance: $instance, redirectURI: $redirectURI) }`, map[string]any{"instance": instance, "redirectURI": redirect}, &result)
+	return result.URL, err
 }

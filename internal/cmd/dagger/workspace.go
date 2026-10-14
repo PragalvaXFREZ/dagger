@@ -1281,8 +1281,8 @@ func annotateWorkspaceRemoteRows(ctx context.Context, rows []*workspaceRemoteRow
 		}
 	}
 	allCheckRows, err := cloudCLI.loadCloudCheckRowsAcrossUserOrgs(ctx, cloudCheckSelectorFlags{
-		GitHubRepo: []string{remote.CloneRef},
-		Workspace:  []string{remote.BaseAddress},
+		GitRepo:   []string{remote.CloneRef},
+		Workspace: []string{remote.BaseAddress},
 	}, false)
 	if err != nil {
 		return err
@@ -1450,7 +1450,7 @@ func ensureAutocheckCloudFeatures(cmd *cobra.Command, client *cloudapi.Client, s
 // matching its owner against the user's Cloud sources.
 func workspaceAutocheckStateFromSource(cmd *cobra.Command, client *cloudapi.Client, repo string) (workspaceAutocheckState, error) {
 	ctx := cmd.Context()
-	repo = "github.com/" + normalizeGitHubRepo(repo)
+	repo = normalizeRepository(repo)
 	sources, err := client.Sources(ctx)
 	if err != nil {
 		return workspaceAutocheckState{}, fmt.Errorf("lookup Cloud sources: %w", err)
@@ -1460,6 +1460,9 @@ func workspaceAutocheckStateFromSource(cmd *cobra.Command, client *cloudapi.Clie
 		// No source for the repo's owner means the Dagger Cloud GitHub App is
 		// not installed on that user/org yet. Point the user at the install page
 		// rather than failing with an opaque "no mapping" error.
+		if repositoryInstance(repo) != "https://github.com" {
+			return workspaceAutocheckState{}, fmt.Errorf("%w: connect GitLab at %s with dagger cloud integration create gitlab --instance %s", errCloudSourceNotConfigured, repositoryInstance(repo), repositoryInstance(repo))
+		}
 		return workspaceAutocheckState{}, gitHubAppNotInstalledError(repo)
 	}
 
@@ -1573,7 +1576,11 @@ func isCloudUnauthorized(err error) bool {
 type repoAccessError struct{ settingsURL string }
 
 func (e *repoAccessError) Error() string {
-	return fmt.Sprintf("Cloud checks need GitHub access to this repository. Visit %s to enable it and then run the command again", e.settingsURL)
+	provider := "GitHub"
+	if !strings.HasPrefix(e.settingsURL, "https://github.com/") {
+		provider = "GitLab"
+	}
+	return fmt.Sprintf("Cloud checks need %s access to this repository. Visit %s to enable it and then run the command again", provider, e.settingsURL)
 }
 
 // installationSettingsURL returns the settings page for the state's GitHub
@@ -1589,20 +1596,29 @@ func installationSettingsURL(state workspaceAutocheckState) string {
 // isRepoNotInInstallation matches the Cloud API's rejection when configuring a
 // repository the GitHub App installation has no access to.
 func isRepoNotInInstallation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "does not belong to installation")
+	return err != nil && (strings.Contains(err.Error(), "does not belong to installation") || strings.Contains(err.Error(), "GitLab repository is not accessible"))
 }
 
 func workspaceSourceForRepo(sources []cloudapi.Source, repo string) (cloudapi.Source, bool) {
-	owner, _, ok := strings.Cut(normalizeGitHubRepo(repo), "/")
-	if !ok {
-		return cloudapi.Source{}, false
-	}
+	canonical := normalizeRepository(repo)
+	var result cloudapi.Source
+	found := false
+	longest := 0
 	for _, source := range sources {
-		if strings.EqualFold(source.Name, owner) {
-			return source, true
+		instance := source.Instance
+		if instance == "" {
+			if sourceIntegrationProvider(source) == "GitLab" {
+				instance = repositoryInstance(source.ConfigURL + "/placeholder")
+			} else {
+				instance = "https://github.com"
+			}
+		}
+		prefix := strings.TrimPrefix(strings.TrimPrefix(instance, "https://"), "http://") + "/" + source.Name + "/"
+		if len(canonical) >= len(prefix) && strings.EqualFold(canonical[:len(prefix)], prefix) && len(prefix) > longest {
+			result, found, longest = source, true, len(prefix)
 		}
 	}
-	return cloudapi.Source{}, false
+	return result, found
 }
 
 func workspaceMappedSourceByInstallation(sources []cloudapi.MappedSource, installationID string) (cloudapi.MappedSource, bool) {
@@ -1623,7 +1639,7 @@ func workspaceAutocheckClient(ctx context.Context, login bool) (*cloudapi.Client
 }
 
 func findWorkspaceAutocheckState(ctx context.Context, client *cloudapi.Client, repo string) (workspaceAutocheckState, bool, error) {
-	repo = "github.com/" + normalizeGitHubRepo(repo)
+	repo = normalizeRepository(repo)
 	repositories, err := client.UserRepositories(ctx, repo)
 	if err != nil {
 		return workspaceAutocheckState{}, false, fmt.Errorf("lookup Cloud repository %s: %w", repo, err)
@@ -1646,9 +1662,9 @@ func findWorkspaceAutocheckState(ctx context.Context, client *cloudapi.Client, r
 }
 
 func workspaceRepositoryForRef(repositories []cloudapi.Repository, repo string) (cloudapi.Repository, bool) {
-	repo = normalizeGitHubRepo(repo)
+	repo = normalizeRepository(repo)
 	for _, repository := range repositories {
-		if normalizeGitHubRepo(repository.Ref) == repo {
+		if normalizeRepository(repository.Ref) == repo {
 			return repository, true
 		}
 	}
@@ -1656,12 +1672,12 @@ func workspaceRepositoryForRef(repositories []cloudapi.Repository, repo string) 
 }
 
 func workspaceSelectedRepos(repos []string, repo string) ([]string, bool) {
-	repo = normalizeGitHubRepo(repo)
+	repo = normalizeRepository(repo)
 	selected := make([]string, 0, len(repos))
 	enabled := false
 	for _, candidate := range repos {
-		selected = append(selected, "github.com/"+normalizeGitHubRepo(candidate))
-		if normalizeGitHubRepo(candidate) == repo {
+		selected = append(selected, normalizeRepository(candidate))
+		if normalizeRepository(candidate) == repo {
 			enabled = true
 		}
 	}
@@ -1676,12 +1692,12 @@ func workspaceRepoIsPublic(setting *cloudapi.RepoSetting) bool {
 }
 
 func setWorkspaceAutocheckRepoSelected(selected []string, repo string, enabled bool) []string {
-	repo = "github.com/" + normalizeGitHubRepo(repo)
+	repo = normalizeRepository(repo)
 	out := make([]string, 0, len(selected)+1)
 	found := false
 	for _, candidate := range selected {
-		candidate = "github.com/" + normalizeGitHubRepo(candidate)
-		if normalizeGitHubRepo(candidate) == normalizeGitHubRepo(repo) {
+		candidate = normalizeRepository(candidate)
+		if normalizeRepository(candidate) == normalizeRepository(repo) {
 			found = true
 			if !enabled {
 				continue

@@ -14,6 +14,8 @@ import (
 )
 
 var githubOpen bool
+var gitlabInstance string
+var integrationRedirectURI string
 
 // githubOAuthRedirect returns the Cloud frontend URL GitHub sends the user
 // back to after consent. It follows the same environment rule as
@@ -42,7 +44,7 @@ var cloudIntegrationCmd = &cobra.Command{
 var cloudIntegrationCreateCmd = &cobra.Command{
 	Use:     "create <provider>",
 	Short:   "Create a new integration of the given provider type",
-	Example: "dagger cloud integration create github",
+	Example: "dagger cloud integration create github\ndagger cloud integration create gitlab --instance https://gitlab.com",
 	Args:    cobra.ExactArgs(1),
 	RunE:    cloudCLI.IntegrationSetup,
 }
@@ -66,6 +68,8 @@ var cloudIntegrationListCmd = &cobra.Command{
 
 func init() {
 	cloudIntegrationCmd.PersistentFlags().BoolVar(&cloudJSON, "json", false, "Print JSON output")
+	cloudIntegrationCreateCmd.Flags().StringVar(&gitlabInstance, "instance", "https://gitlab.com", "Configured GitLab instance URL")
+	cloudIntegrationCreateCmd.Flags().StringVar(&integrationRedirectURI, "redirect-uri", "", "Registered Cloud OAuth callback URL")
 	cloudIntegrationCreateCmd.Flags().BoolVar(&githubOpen, "open", false, "Open the setup URL in a browser")
 	cloudIntegrationCmd.AddCommand(cloudIntegrationCreateCmd, cloudIntegrationListCmd, cloudIntegrationRmCmd)
 	cloudCmd.AddCommand(cloudIntegrationCmd)
@@ -91,6 +95,8 @@ func (cli *CloudCLI) IntegrationSetup(cmd *cobra.Command, args []string) error {
 	switch strings.ToLower(args[0]) {
 	case "github":
 		return cli.integrationSetupGitHub(cmd)
+	case "gitlab":
+		return cli.integrationSetupGitLab(cmd)
 	default:
 		return unsupportedIntegrationProvider(args[0])
 	}
@@ -175,8 +181,18 @@ func (cli *CloudCLI) githubConnected(ctx context.Context, client *cloudapi.Clien
 		return true, conn.GitHubLogin
 	}
 	// No stored connection, but a GitHub identity may be available via Auth0.
-	if _, err := client.Sources(ctx); err == nil {
-		return true, ""
+	if sources, err := client.Sources(ctx); err == nil {
+		for _, source := range sources {
+			if sourceIntegrationProvider(source) == "GitHub" || (source.Provider == "" && !strings.HasPrefix(source.ID, "-") && source.ConfigURL == "") {
+				return true, ""
+			}
+		}
+		if len(sources) == 0 {
+			setup, err := client.GitLabSetup(ctx)
+			if err != nil || len(setup.Connections) == 0 {
+				return true, ""
+			}
+		}
 	}
 	return false, ""
 }
@@ -271,10 +287,16 @@ func canonicalProviderName(input string) string {
 }
 
 func unsupportedIntegrationProvider(provider string) error {
-	return fmt.Errorf("unsupported integration %q; supported integrations: github", provider)
+	return fmt.Errorf("unsupported integration %q; supported integrations: github, gitlab", provider)
 }
 
 func sourceIntegrationProvider(source cloudapi.Source) string {
+	if provider := canonicalProviderName(source.Provider); provider != "" {
+		return provider
+	}
+	if strings.HasPrefix(source.ID, "-") || source.Type == "GitLab" {
+		return "GitLab"
+	}
 	configURL, err := url.Parse(source.ConfigURL)
 	if err == nil {
 		switch strings.ToLower(configURL.Hostname()) {
@@ -290,7 +312,7 @@ func sourceIntegrationProvider(source cloudapi.Source) string {
 }
 
 func integrationProviderSupportsAutocheck(provider string) bool {
-	return strings.EqualFold(provider, "GitHub")
+	return strings.EqualFold(provider, "GitHub") || strings.EqualFold(provider, "GitLab")
 }
 
 func onOff(enabled bool) string {
@@ -298,4 +320,56 @@ func onOff(enabled bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func gitlabOAuthRedirect() string {
+	if integrationRedirectURI != "" {
+		return integrationRedirectURI
+	}
+	if frontend := os.Getenv("DAGGER_CLOUD_EXTERNAL_URL"); frontend != "" {
+		return strings.TrimRight(frontend, "/") + "/gitlab/callback"
+	}
+	return strings.Replace(githubOAuthRedirect(), "/github/callback", "/gitlab/callback", 1)
+}
+func (cli *CloudCLI) integrationSetupGitLab(cmd *cobra.Command) error {
+	client, _, err := cli.cloudClient(cmd.Context())
+	if err != nil {
+		return err
+	}
+	instance := strings.TrimRight(gitlabInstance, "/")
+	setup, err := client.GitLabSetup(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("lookup GitLab integration configuration: %w", err)
+	}
+	registered := false
+	for _, origin := range setup.Instances {
+		if origin == instance {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		return fmt.Errorf("GitLab instance %s is not registered in Dagger Cloud; configured instances: %s", instance, strings.Join(setup.Instances, ", "))
+	}
+	for _, connection := range setup.Connections {
+		if connection.Instance != instance {
+			continue
+		}
+		if cloudJSON {
+			return writeCloudJSON(cmd, map[string]string{"status": "connected", "provider": "gitlab", "instance": instance, "username": connection.Username})
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "GitLab at %s is already connected as %s.\n", instance, connection.Username)
+		return nil
+	}
+	redirect := gitlabOAuthRedirect()
+	oauthURL, err := client.GitLabOAuthURL(cmd.Context(), instance, redirect)
+	if err != nil {
+		return err
+	}
+	openGitHubSetupURL(cmd, oauthURL)
+	if cloudJSON {
+		return writeCloudJSON(cmd, map[string]string{"url": oauthURL, "redirectURI": redirect, "provider": "gitlab", "instance": instance})
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Open this URL to connect GitLab at %s:\n%s\n", instance, oauthURL)
+	return nil
 }

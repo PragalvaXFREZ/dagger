@@ -42,7 +42,7 @@ func TestIntegrationAccountEntriesFromSources(t *testing.T) {
 			Provider:  "GitLab",
 			Account:   "acme",
 			Type:      "Organization",
-			Autocheck: false,
+			Autocheck: true,
 			ConfigURL: "https://gitlab.com/acme",
 		},
 	}, entries)
