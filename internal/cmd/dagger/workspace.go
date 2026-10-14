@@ -1461,7 +1461,15 @@ func workspaceAutocheckStateFromSource(cmd *cobra.Command, client *cloudapi.Clie
 		// not installed on that user/org yet. Point the user at the install page
 		// rather than failing with an opaque "no mapping" error.
 		if repositoryInstance(repo) != "https://github.com" {
-			return workspaceAutocheckState{}, fmt.Errorf("%w: connect GitLab at %s with dagger cloud integration create gitlab --instance %s", errCloudSourceNotConfigured, repositoryInstance(repo), repositoryInstance(repo))
+			setup, err := client.GitLabSetup(ctx)
+			if err != nil {
+				return workspaceAutocheckState{}, fmt.Errorf("%w: lookup GitLab configuration: %v", errCloudSourceNotConfigured, err)
+			}
+			instance, err := registeredGitLabInstance(setup, repo)
+			if err != nil {
+				return workspaceAutocheckState{}, fmt.Errorf("%w: %v", errCloudSourceNotConfigured, err)
+			}
+			return workspaceAutocheckState{}, fmt.Errorf("%w: discover GitLab groups with dagger cloud integration create gitlab --instance %s, then configure the source's bot or service access in Cloud Repository settings", errCloudSourceNotConfigured, instance)
 		}
 		return workspaceAutocheckState{}, gitHubAppNotInstalledError(repo)
 	}

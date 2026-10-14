@@ -16,6 +16,7 @@ import (
 var githubOpen bool
 var gitlabInstance string
 var integrationRedirectURI string
+var gitlabReauthorize bool
 
 // githubOAuthRedirect returns the Cloud frontend URL GitHub sends the user
 // back to after consent. It follows the same environment rule as
@@ -69,6 +70,7 @@ var cloudIntegrationListCmd = &cobra.Command{
 func init() {
 	cloudIntegrationCmd.PersistentFlags().BoolVar(&cloudJSON, "json", false, "Print JSON output")
 	cloudIntegrationCreateCmd.Flags().StringVar(&gitlabInstance, "instance", "https://gitlab.com", "Configured GitLab instance URL")
+	cloudIntegrationCreateCmd.Flags().BoolVar(&gitlabReauthorize, "reauthorize", false, "Repeat GitLab account discovery authorization")
 	cloudIntegrationCreateCmd.Flags().StringVar(&integrationRedirectURI, "redirect-uri", "", "Registered Cloud OAuth callback URL")
 	cloudIntegrationCreateCmd.Flags().BoolVar(&githubOpen, "open", false, "Open the setup URL in a browser")
 	cloudIntegrationCmd.AddCommand(cloudIntegrationCreateCmd, cloudIntegrationListCmd, cloudIntegrationRmCmd)
@@ -352,13 +354,13 @@ func (cli *CloudCLI) integrationSetupGitLab(cmd *cobra.Command) error {
 		return fmt.Errorf("GitLab instance %s is not registered in Dagger Cloud; configured instances: %s", instance, strings.Join(setup.Instances, ", "))
 	}
 	for _, connection := range setup.Connections {
-		if connection.Instance != instance {
+		if connection.Instance != instance || gitlabReauthorize {
 			continue
 		}
 		if cloudJSON {
-			return writeCloudJSON(cmd, map[string]string{"status": "connected", "provider": "gitlab", "instance": instance, "username": connection.Username})
+			return writeCloudJSON(cmd, map[string]string{"status": "connected", "provider": "gitlab", "instance": instance, "username": connection.Username, "access": "discovery"})
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "GitLab at %s is already connected as %s.\n", instance, connection.Username)
+		fmt.Fprintf(cmd.OutOrStdout(), "GitLab at %s is authorized for discovery as %s. Configure a bot or service token for each Git source in Cloud Repository settings.\n", instance, connection.Username)
 		return nil
 	}
 	redirect := gitlabOAuthRedirect()

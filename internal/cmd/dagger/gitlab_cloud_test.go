@@ -10,7 +10,10 @@ import (
 	"time"
 
 	cloudapi "github.com/dagger/dagger/internal/cloud"
+	"github.com/dagger/dagger/internal/cloud/auth"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 )
 
 func TestGitLabWorkspaceSourcesPreserveInstanceAndNestedNamespace(t *testing.T) {
@@ -44,6 +47,20 @@ func TestGitLabWorkspaceSourcesPreserveInstanceAndNestedNamespace(t *testing.T) 
 	instance, err := registeredGitLabInstance(&cloudapi.GitLabSetup{Instances: []string{"https://gitlab.com", "http://localhost:8929"}}, "localhost:8929/team/sub/project")
 	require.NoError(t, err)
 	require.Equal(t, "http://localhost:8929", instance)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"sources":[],"gitlabInstances":["http://localhost:8929"],"gitlabConnections":[]}}`)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("DAGGER_CLOUD_URL", server.URL)
+	client, err := cloudapi.NewClient(t.Context(), &auth.Cloud{Token: &oauth2.Token{AccessToken: "test-only", TokenType: "Bearer"}})
+	require.NoError(t, err)
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	_, err = workspaceAutocheckStateFromSource(cmd, client, "http://localhost:8929/team/sub/project.git")
+	require.ErrorIs(t, err, errCloudSourceNotConfigured)
+	require.Contains(t, err.Error(), "--instance http://localhost:8929")
+	require.NotContains(t, err.Error(), "https://localhost:8929")
 }
 
 // Exercise the actual built command's credential/config/argument handoff, using
@@ -52,9 +69,11 @@ func TestGitLabIntegrationCommandHandoff(t *testing.T) {
 	for _, tc := range []struct {
 		name, instance string
 		connected      bool
+		reauthorize    bool
 	}{
 		{name: "public account remains connected", instance: "https://gitlab.com", connected: true},
 		{name: "connect second local instance", instance: "http://localhost:8929"},
+		{name: "reauthorize existing discovery account", instance: "https://gitlab.com", reauthorize: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var operations []string
@@ -72,7 +91,7 @@ func TestGitLabIntegrationCommandHandoff(t *testing.T) {
 					fmt.Fprint(w, `{"data":{"gitlabInstances":["https://gitlab.com","http://localhost:8929"],"gitlabConnections":[{"id":"public","instance":"https://gitlab.com","username":"public-user"}]}}`)
 				case "GetGitLabOAuthURL":
 					require.Equal(t, map[string]string{"instance": tc.instance, "redirectURI": "http://localhost:3001/gitlab/callback"}, request.Variables)
-					fmt.Fprint(w, `{"data":{"gitlabOAuthURL":"http://localhost:8929/oauth/authorize?state=test-only"}}`)
+					fmt.Fprintf(w, `{"data":{"gitlabOAuthURL":%q}}`, tc.instance+"/oauth/authorize?state=test-only")
 				default:
 					t.Errorf("unexpected operation %s", request.Operation)
 					http.Error(w, "unexpected operation", http.StatusBadRequest)
@@ -80,6 +99,9 @@ func TestGitLabIntegrationCommandHandoff(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			args := []string{"cloud", "integration", "create", "gitlab", "--instance", tc.instance, "--redirect-uri", "http://localhost:3001/gitlab/callback", "--json"}
+			if tc.reauthorize {
+				args = append(args, "--reauthorize")
+			}
 			daggerCloudWithConfig(t, []string{"DAGGER_CLOUD_URL=" + server.URL, "DAGGER_PROGRESS=report"}, args,
 				map[string]string{"credentials.json": `{"access_token":"test-login-token","token_type":"Bearer"}`},
 				func(t *testing.T, err error, out, stderr *bytes.Buffer) {
@@ -93,7 +115,7 @@ func TestGitLabIntegrationCommandHandoff(t *testing.T) {
 						require.Equal(t, []string{"GetGitLabSetup"}, operations)
 					} else {
 						require.Equal(t, "http://localhost:3001/gitlab/callback", result["redirectURI"])
-						require.Equal(t, "http://localhost:8929/oauth/authorize?state=test-only", result["url"])
+						require.Equal(t, tc.instance+"/oauth/authorize?state=test-only", result["url"])
 						require.Equal(t, []string{"GetGitLabSetup", "GetGitLabOAuthURL"}, operations)
 					}
 				})
